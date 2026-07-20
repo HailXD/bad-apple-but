@@ -248,16 +248,16 @@ function Add-Button($text, $x, $y, $width) {
     return $button
 }
 Add-Label 'Input video' 20 20
-$input = [Windows.Forms.TextBox]::new()
-$input.Location = [Drawing.Point]::new(20, 43)
-$input.Size = [Drawing.Size]::new(410, 28)
-Set-Field $input
-[void]$form.Controls.Add($input)
+$inputPath = [Windows.Forms.TextBox]::new()
+$inputPath.Location = [Drawing.Point]::new(20, 43)
+$inputPath.Size = [Drawing.Size]::new(410, 28)
+Set-Field $inputPath
+[void]$form.Controls.Add($inputPath)
 $inputButton = Add-Button 'Browse' 440 41 80
 $inputButton.Add_Click({
     $dialog = [Windows.Forms.OpenFileDialog]::new()
     $dialog.Filter = 'Video files|*.mp4;*.mkv;*.webm;*.mov;*.avi|All files|*.*'
-    if ($dialog.ShowDialog() -eq 'OK') { $input.Text = $dialog.FileName }
+    if ($dialog.ShowDialog($form) -eq 'OK') { $inputPath.Text = $dialog.FileName }
 })
 Add-Label 'Type' 20 85
 $type = [Windows.Forms.ComboBox]::new()
@@ -317,40 +317,40 @@ $remove.Add_Click({
     }
 })
 Add-Label 'Output video (blank for automatic)' 20 305
-$output = [Windows.Forms.TextBox]::new()
-$output.Location = [Drawing.Point]::new(20, 328)
-$output.Size = [Drawing.Size]::new(410, 28)
-Set-Field $output
-[void]$form.Controls.Add($output)
+$outputPath = [Windows.Forms.TextBox]::new()
+$outputPath.Location = [Drawing.Point]::new(20, 328)
+$outputPath.Size = [Drawing.Size]::new(410, 28)
+Set-Field $outputPath
+[void]$form.Controls.Add($outputPath)
 $outputButton = Add-Button 'Browse' 440 326 80
 $outputButton.Add_Click({
     $dialog = [Windows.Forms.SaveFileDialog]::new()
     $dialog.Filter = 'MP4 video|*.mp4'
     $dialog.DefaultExt = 'mp4'
-    if ($dialog.ShowDialog() -eq 'OK') { $output.Text = $dialog.FileName }
+    if ($dialog.ShowDialog($form) -eq 'OK') { $outputPath.Text = $dialog.FileName }
 })
 $type.Add_SelectedIndexChanged({
     $enabled = $type.SelectedItem -ne 'all'
-    $output.Enabled = $enabled
+    $outputPath.Enabled = $enabled
     $outputButton.Enabled = $enabled
 })
 $start = Add-Button 'Start' 320 380 95
 $cancel = Add-Button 'Cancel' 425 380 95
 $cancel.Add_Click({ $form.Close() })
 $start.Add_Click({
-    if (-not [IO.File]::Exists($input.Text)) {
-        [void][Windows.Forms.MessageBox]::Show('Select an input video', 'Bad Apple converter')
+    if (-not [IO.File]::Exists($inputPath.Text)) {
+        [void][Windows.Forms.MessageBox]::Show($form, 'Select an input video', 'Bad Apple converter')
         return
     }
     $form.DialogResult = 'OK'
     $form.Close()
 })
 if ($form.ShowDialog() -ne 'OK') { exit 1 }
-[Console]::Out.WriteLine($input.Text)
+[Console]::Out.WriteLine($inputPath.Text)
 [Console]::Out.WriteLine($type.SelectedItem)
 [Console]::Out.WriteLine([int]$fps.Value)
 [Console]::Out.WriteLine(($counts.Items -join ','))
-[Console]::Out.WriteLine($output.Text)
+[Console]::Out.WriteLine($outputPath.Text)
 "#;
     let result = Command::new("powershell")
         .args(["-NoProfile", "-STA", "-Command", GUI])
