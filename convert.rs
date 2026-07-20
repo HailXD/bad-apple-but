@@ -15,6 +15,7 @@ const DEFAULT_COUNT: usize = 1;
 const FUTURE_FRAMES: usize = 30;
 const SAMPLES: usize = 4096;
 const TOP: usize = 16;
+const MAX_BATCH: usize = 8;
 const BANDS: i32 = 15;
 const MAX_RADIUS: i32 = 900;
 const RADII: [i32; 19] = [
@@ -252,10 +253,8 @@ fn read_frame(input: &mut ChildStdout) -> io::Result<Option<Vec<u8>>> {
     }
 }
 
-fn prefixes(canvas: &[u8], frames: &Frames) -> Prefix {
+fn prefixes(canvas: &[u8], frames: &Frames, prefixes: &mut Prefix) {
     let stride = WIDTH + 1;
-    let mut black = vec![0; stride * (HEIGHT + 1)];
-    let mut white = vec![0; stride * (HEIGHT + 1)];
     let count = frames.queue.len() as i64;
     let total = 255 * count * (count + 1) / 2;
     for y in 0..HEIGHT {
@@ -269,11 +268,12 @@ fn prefixes(canvas: &[u8], frames: &Frames) -> Prefix {
             } else {
                 black_row += sum - total;
             }
-            black[(y + 1) * stride + x + 1] = black[y * stride + x + 1] + black_row;
-            white[(y + 1) * stride + x + 1] = white[y * stride + x + 1] + white_row;
+            prefixes.black[(y + 1) * stride + x + 1] =
+                prefixes.black[y * stride + x + 1] + black_row;
+            prefixes.white[(y + 1) * stride + x + 1] =
+                prefixes.white[y * stride + x + 1] + white_row;
         }
     }
-    Prefix { black, white }
 }
 
 fn rect_sum(prefix: &[i64], left: i32, top: i32, right: i32, bottom: i32) -> i64 {
@@ -362,10 +362,10 @@ fn intersects(x: i32, y: i32, radius: i32) -> bool {
     dx * dx + dy * dy <= radius * radius
 }
 
-fn best_circle(prefixes: &Prefix, canvas: &[u8], frame: usize) -> Circle {
+fn best_circle(prefixes: &Prefix, canvas: &[u8], frame: usize, samples: usize) -> Circle {
     let mut rng = Rng(0x9e3779b97f4a7c15 ^ frame as u64);
     let mut top = Vec::with_capacity(TOP + 1);
-    for sample in 0..SAMPLES {
+    for sample in 0..samples {
         let radius = if sample % 3 == 0 {
             RADII[(sample / 3) % RADII.len()]
         } else if sample % 3 == 1 {
@@ -483,14 +483,32 @@ fn process(
     };
     let mut frames = Frames::new(limit);
     let mut canvases = vec![vec![0; PIXELS]; counts.len()];
+    let prefix_size = (WIDTH + 1) * (HEIGHT + 1);
+    let mut prefix = Prefix {
+        black: vec![0; prefix_size],
+        white: vec![0; prefix_size],
+    };
+    let mut circles = Vec::with_capacity(MAX_BATCH);
     let mut frame = 0;
     frames.fill(&mut input).map_err(|error| error.to_string())?;
     while !frames.queue.is_empty() {
         for (canvas, shapes) in canvases.iter_mut().zip(counts) {
-            for shape in 0..*shapes {
-                let prefixes = prefixes(canvas, &frames);
-                let circle = best_circle(&prefixes, canvas, *shapes * frame + shape);
-                draw(canvas, circle);
+            let batch = (*shapes / MAX_BATCH).clamp(1, MAX_BATCH);
+            let samples = SAMPLES / batch;
+            for start in (0..*shapes).step_by(batch) {
+                prefixes(canvas, &frames, &mut prefix);
+                circles.clear();
+                for shape in start..(start + batch).min(*shapes) {
+                    circles.push(best_circle(
+                        &prefix,
+                        canvas,
+                        *shapes * frame + shape,
+                        samples,
+                    ));
+                }
+                for circle in circles.drain(..) {
+                    draw(canvas, circle);
+                }
             }
         }
         let result = if canvases.len() == 1 {
