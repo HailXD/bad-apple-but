@@ -55,6 +55,7 @@ struct Prefix {
 struct Frames {
     queue: VecDeque<Vec<u8>>,
     sum: Vec<u32>,
+    linear: Vec<u32>,
     weighted: Vec<u32>,
     limit: usize,
 }
@@ -79,6 +80,7 @@ impl Frames {
         Self {
             queue: VecDeque::new(),
             sum: vec![0; PIXELS],
+            linear: vec![0; PIXELS],
             weighted: vec![0; PIXELS],
             limit,
         }
@@ -96,8 +98,10 @@ impl Frames {
 
     fn push(&mut self, frame: Vec<u8>) {
         for i in 0..PIXELS {
-            self.weighted[i] += self.sum[i] + frame[i] as u32;
-            self.sum[i] += frame[i] as u32;
+            let value = frame[i] as u32;
+            self.weighted[i] += 2 * self.linear[i] + self.sum[i] + value;
+            self.linear[i] += self.sum[i] + value;
+            self.sum[i] += value;
         }
         self.queue.push_back(frame);
     }
@@ -108,7 +112,8 @@ impl Frames {
         for i in 0..PIXELS {
             let value = frame[i] as u32;
             self.sum[i] -= value;
-            self.weighted[i] -= count * value;
+            self.linear[i] -= count * value;
+            self.weighted[i] -= count * count * value;
         }
         if let Some(frame) = read_frame(input)? {
             self.push(frame);
@@ -474,7 +479,7 @@ fn read_frame(input: &mut ChildStdout) -> io::Result<Option<Vec<u8>>> {
 fn prefixes(canvas: &[u8], frames: &Frames, prefixes: &mut Prefix) {
     let stride = WIDTH + 1;
     let count = frames.queue.len() as i64;
-    let total = 255 * count * (count + 1) / 2;
+    let total = 255 * count * (count + 1) * (2 * count + 1) / 6;
     for y in 0..HEIGHT {
         let mut black_row = 0;
         let mut white_row = 0;
