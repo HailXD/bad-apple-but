@@ -6,7 +6,10 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 const WIDTH: usize = 1280;
 const HEIGHT: usize = 720;
+const HALF_WIDTH: usize = WIDTH / 2;
+const HALF_HEIGHT: usize = HEIGHT / 2;
 const PIXELS: usize = WIDTH * HEIGHT;
+const GRID_SIZE: usize = 4;
 const DEFAULT_FPS: usize = 30;
 const DEFAULT_COUNT: usize = 1;
 const FUTURE_FRAMES: usize = 30;
@@ -30,6 +33,7 @@ struct Args {
     mode: Option<Mode>,
     fps: usize,
     count: usize,
+    grid: Option<[usize; GRID_SIZE]>,
     all: bool,
 }
 
@@ -119,6 +123,7 @@ fn args() -> Result<Args, String> {
     let mut mode = None;
     let mut fps = DEFAULT_FPS;
     let mut count = DEFAULT_COUNT;
+    let mut grid = None;
     let mut all = false;
     while let Some(flag) = values.next() {
         if flag == "--all" {
@@ -158,6 +163,19 @@ fn args() -> Result<Args, String> {
                     return Err("count must be a positive integer".into());
                 }
             }
+            Some("--grid") => {
+                let counts = value
+                    .to_str()
+                    .ok_or("grid must contain four positive integers")?
+                    .split(',')
+                    .map(|count| count.parse::<usize>())
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| "grid must contain four positive integers")?;
+                if counts.len() != GRID_SIZE || counts.contains(&0) {
+                    return Err("grid must contain four positive integers".into());
+                }
+                grid = Some([counts[0], counts[1], counts[2], counts[3]]);
+            }
             _ => return Err(format!("unknown option {}", flag.to_string_lossy())),
         }
     }
@@ -173,6 +191,7 @@ fn args() -> Result<Args, String> {
         mode,
         fps,
         count,
+        grid,
         all,
     })
 }
@@ -432,10 +451,24 @@ fn draw(canvas: &mut [u8], circle: Circle) {
     }
 }
 
+fn tile(canvases: &[Vec<u8>]) -> Vec<u8> {
+    let mut frame = vec![0; PIXELS];
+    for (cell, canvas) in canvases.iter().enumerate() {
+        let left = cell % 2 * HALF_WIDTH;
+        let top = cell / 2 * HALF_HEIGHT;
+        for y in 0..HALF_HEIGHT {
+            for x in 0..HALF_WIDTH {
+                frame[(top + y) * WIDTH + left + x] = canvas[y * 2 * WIDTH + x * 2];
+            }
+        }
+    }
+    frame
+}
+
 fn process(
     mode: Mode,
     fps: usize,
-    shapes: usize,
+    counts: &[usize],
     decoder: &mut Child,
     encoder: &mut Child,
 ) -> Result<usize, String> {
@@ -449,18 +482,23 @@ fn process(
         Mode::Future => FUTURE_FRAMES,
     };
     let mut frames = Frames::new(limit);
-    let mut canvas = vec![0; PIXELS];
+    let mut canvases = vec![vec![0; PIXELS]; counts.len()];
     let mut frame = 0;
     frames.fill(&mut input).map_err(|error| error.to_string())?;
     while !frames.queue.is_empty() {
-        for shape in 0..shapes {
-            let prefixes = prefixes(&canvas, &frames);
-            let circle = best_circle(&prefixes, &canvas, shapes * frame + shape);
-            draw(&mut canvas, circle);
+        for (canvas, shapes) in canvases.iter_mut().zip(counts) {
+            for shape in 0..*shapes {
+                let prefixes = prefixes(canvas, &frames);
+                let circle = best_circle(&prefixes, canvas, *shapes * frame + shape);
+                draw(canvas, circle);
+            }
         }
-        output
-            .write_all(&canvas)
-            .map_err(|error| error.to_string())?;
+        let result = if canvases.len() == 1 {
+            output.write_all(&canvases[0])
+        } else {
+            output.write_all(&tile(&canvases))
+        };
+        result.map_err(|error| error.to_string())?;
         frames
             .advance(&mut input)
             .map_err(|error| error.to_string())?;
@@ -473,7 +511,7 @@ fn process(
     Ok(frame)
 }
 
-fn output(mode: Mode, fps: usize, count: usize) -> PathBuf {
+fn output(mode: Mode, fps: usize, count: usize, grid: Option<[usize; GRID_SIZE]>) -> PathBuf {
     let mut name = String::from("Bad Apple");
     if matches!(mode, Mode::Future) {
         name.push_str("-future");
@@ -481,7 +519,12 @@ fn output(mode: Mode, fps: usize, count: usize) -> PathBuf {
     if fps != DEFAULT_FPS {
         name.push_str(&format!("-{fps}"));
     }
-    if count != DEFAULT_COUNT {
+    if let Some(counts) = grid {
+        name.push_str("-grid");
+        for count in counts {
+            name.push_str(&format!("-{count}"));
+        }
+    } else if count != DEFAULT_COUNT {
         name.push_str(&format!("-{count}"));
     }
     name.push_str(".mp4");
@@ -498,7 +541,10 @@ fn compile(args: &Args, output: &PathBuf, mode: Mode) -> Result<(), String> {
             return Err(format!("ffmpeg encoder: {error}"));
         }
     };
-    let result = process(mode, args.fps, args.count, &mut decoder, &mut encoder);
+    let result = match args.grid {
+        Some(grid) => process(mode, args.fps, &grid, &mut decoder, &mut encoder),
+        None => process(mode, args.fps, &[args.count], &mut decoder, &mut encoder),
+    };
     if result.is_err() {
         let _ = decoder.kill();
         let _ = encoder.kill();
@@ -520,7 +566,7 @@ fn run() -> Result<(), String> {
     let args = args()?;
     if args.all {
         for mode in [Mode::Circle, Mode::Future] {
-            compile(&args, &output(mode, args.fps, args.count), mode)?;
+            compile(&args, &output(mode, args.fps, args.count, args.grid), mode)?;
         }
         return Ok(());
     }
@@ -535,7 +581,7 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("error: {error}");
         eprintln!(
-            "usage: compile.exe -i input.mp4 [-o output.mp4 --type circle|circle-future | --all] [--fps FPS] [--count COUNT]"
+            "usage: compile.exe -i input.mp4 [-o output.mp4 --type circle|circle-future | --all] [--fps FPS] [--count COUNT | --grid TL,TR,BL,BR]"
         );
         std::process::exit(1);
     }
