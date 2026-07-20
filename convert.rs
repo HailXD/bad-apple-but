@@ -1,0 +1,465 @@
+use std::collections::VecDeque;
+use std::env;
+use std::io::{self, Read, Write};
+use std::path::PathBuf;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+
+const WIDTH: usize = 1280;
+const HEIGHT: usize = 720;
+const PIXELS: usize = WIDTH * HEIGHT;
+const FPS: usize = 30;
+const FUTURE_FRAMES: usize = 30;
+const SAMPLES: usize = 4096;
+const TOP: usize = 16;
+const BANDS: i32 = 15;
+const MAX_RADIUS: i32 = 900;
+const RADII: [i32; 19] = [
+    1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 360, 512, 720,
+];
+
+enum Mode {
+    Circle,
+    Future,
+}
+
+struct Args {
+    input: PathBuf,
+    output: PathBuf,
+    mode: Mode,
+}
+
+#[derive(Clone, Copy)]
+struct Circle {
+    x: i32,
+    y: i32,
+    radius: i32,
+    white: bool,
+    score: i64,
+}
+
+struct Prefix {
+    black: Vec<i64>,
+    white: Vec<i64>,
+}
+
+struct Frames {
+    queue: VecDeque<Vec<u8>>,
+    sum: Vec<u32>,
+    weighted: Vec<u32>,
+    limit: usize,
+}
+
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 >> 16) as u32
+    }
+
+    fn range(&mut self, start: i32, end: i32) -> i32 {
+        start + (self.next() as u64 * (end - start) as u64 >> 32) as i32
+    }
+}
+
+impl Frames {
+    fn new(limit: usize) -> Self {
+        Self {
+            queue: VecDeque::new(),
+            sum: vec![0; PIXELS],
+            weighted: vec![0; PIXELS],
+            limit,
+        }
+    }
+
+    fn fill(&mut self, input: &mut ChildStdout) -> io::Result<()> {
+        while self.queue.len() < self.limit {
+            let Some(frame) = read_frame(input)? else {
+                break;
+            };
+            self.push(frame);
+        }
+        Ok(())
+    }
+
+    fn push(&mut self, frame: Vec<u8>) {
+        for i in 0..PIXELS {
+            self.weighted[i] += self.sum[i] + frame[i] as u32;
+            self.sum[i] += frame[i] as u32;
+        }
+        self.queue.push_back(frame);
+    }
+
+    fn advance(&mut self, input: &mut ChildStdout) -> io::Result<()> {
+        let count = self.queue.len() as u32;
+        let frame = self.queue.pop_front().unwrap();
+        for i in 0..PIXELS {
+            let value = frame[i] as u32;
+            self.sum[i] -= value;
+            self.weighted[i] -= count * value;
+        }
+        if let Some(frame) = read_frame(input)? {
+            self.push(frame);
+        }
+        Ok(())
+    }
+}
+
+fn args() -> Result<Args, String> {
+    let mut values = env::args_os().skip(1);
+    let mut input = None;
+    let mut output = None;
+    let mut mode = None;
+    while let Some(flag) = values.next() {
+        let value = values
+            .next()
+            .ok_or_else(|| format!("missing value after {}", flag.to_string_lossy()))?;
+        match flag.to_str() {
+            Some("-i") => input = Some(value.into()),
+            Some("-o") => output = Some(value.into()),
+            Some("--type") => {
+                mode = Some(match value.to_str() {
+                    Some("circle") => Mode::Circle,
+                    Some("circle-future") => Mode::Future,
+                    _ => return Err("type must be circle or circle-future".into()),
+                })
+            }
+            _ => return Err(format!("unknown option {}", flag.to_string_lossy())),
+        }
+    }
+    Ok(Args {
+        input: input.ok_or("missing -i")?,
+        output: output.ok_or("missing -o")?,
+        mode: mode.ok_or("missing --type")?,
+    })
+}
+
+fn decoder(input: &PathBuf) -> io::Result<Child> {
+    Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(input)
+        .args([
+            "-vf",
+            "fps=30,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,format=gray",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray",
+            "-",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+}
+
+fn encoder(input: &PathBuf, output: &PathBuf) -> io::Result<Child> {
+    Command::new("ffmpeg")
+        .args([
+            "-v", "error", "-f", "rawvideo", "-pix_fmt", "gray", "-s:v", "1280x720", "-r", "30",
+            "-i", "-", "-i",
+        ])
+        .arg(input)
+        .args([
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a?",
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "p5",
+            "-cq",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+            "-r",
+            "30",
+            "-c:a",
+            "copy",
+            "-shortest",
+            "-y",
+        ])
+        .arg(output)
+        .stdin(Stdio::piped())
+        .spawn()
+}
+
+fn read_frame(input: &mut ChildStdout) -> io::Result<Option<Vec<u8>>> {
+    let mut frame = vec![0; PIXELS];
+    match input.read(&mut frame[..1])? {
+        0 => Ok(None),
+        _ => {
+            input.read_exact(&mut frame[1..])?;
+            Ok(Some(frame))
+        }
+    }
+}
+
+fn prefixes(canvas: &[u8], frames: &Frames) -> Prefix {
+    let stride = WIDTH + 1;
+    let mut black = vec![0; stride * (HEIGHT + 1)];
+    let mut white = vec![0; stride * (HEIGHT + 1)];
+    let count = frames.queue.len() as i64;
+    let total = 255 * count * (count + 1) / 2;
+    for y in 0..HEIGHT {
+        let mut black_row = 0;
+        let mut white_row = 0;
+        for x in 0..WIDTH {
+            let i = y * WIDTH + x;
+            let sum = 2 * frames.weighted[i] as i64;
+            if canvas[i] == 0 {
+                white_row += total - sum;
+            } else {
+                black_row += sum - total;
+            }
+            black[(y + 1) * stride + x + 1] = black[y * stride + x + 1] + black_row;
+            white[(y + 1) * stride + x + 1] = white[y * stride + x + 1] + white_row;
+        }
+    }
+    Prefix { black, white }
+}
+
+fn rect_sum(prefix: &[i64], left: i32, top: i32, right: i32, bottom: i32) -> i64 {
+    let left = left.clamp(0, WIDTH as i32) as usize;
+    let right = right.clamp(0, WIDTH as i32) as usize;
+    let top = top.clamp(0, HEIGHT as i32) as usize;
+    let bottom = bottom.clamp(0, HEIGHT as i32) as usize;
+    if left >= right || top >= bottom {
+        return 0;
+    }
+    let stride = WIDTH + 1;
+    prefix[bottom * stride + right] - prefix[top * stride + right] - prefix[bottom * stride + left]
+        + prefix[top * stride + left]
+}
+
+fn approx(prefix: &[i64], x: i32, y: i32, radius: i32) -> i64 {
+    let diameter = radius * 2 + 1;
+    let mut score = 0;
+    for band in 0..BANDS.min(diameter) {
+        let top = -radius + band * diameter / BANDS.min(diameter);
+        let bottom = -radius + (band + 1) * diameter / BANDS.min(diameter);
+        let dy = (top + bottom - 1) / 2;
+        let half = ((radius * radius - dy * dy) as u32).isqrt() as i32;
+        score += rect_sum(prefix, x - half, y + top, x + half + 1, y + bottom);
+    }
+    score
+}
+
+fn exact(prefix: &[i64], x: i32, y: i32, radius: i32) -> i64 {
+    (-radius..=radius)
+        .map(|dy| {
+            let half = ((radius * radius - dy * dy) as u32).isqrt() as i32;
+            rect_sum(prefix, x - half, y + dy, x + half + 1, y + dy + 1)
+        })
+        .sum()
+}
+
+fn add_top(top: &mut Vec<Circle>, circle: Circle) {
+    if top.len() < TOP || circle.score < top.last().unwrap().score {
+        let at = top
+            .binary_search_by_key(&circle.score, |item| item.score)
+            .unwrap_or_else(|at| at);
+        top.insert(at, circle);
+        top.truncate(TOP);
+    }
+}
+
+fn scored(
+    prefixes: &Prefix,
+    x: i32,
+    y: i32,
+    radius: i32,
+    white: bool,
+    exact_score: bool,
+) -> Circle {
+    let prefix = if white {
+        &prefixes.white
+    } else {
+        &prefixes.black
+    };
+    let score = if exact_score {
+        exact(prefix, x, y, radius)
+    } else {
+        approx(prefix, x, y, radius)
+    };
+    Circle {
+        x,
+        y,
+        radius,
+        white,
+        score,
+    }
+}
+
+fn intersects(x: i32, y: i32, radius: i32) -> bool {
+    let dx = if x < 0 {
+        -x
+    } else {
+        (x - WIDTH as i32 + 1).max(0)
+    };
+    let dy = if y < 0 {
+        -y
+    } else {
+        (y - HEIGHT as i32 + 1).max(0)
+    };
+    dx * dx + dy * dy <= radius * radius
+}
+
+fn best_circle(prefixes: &Prefix, canvas: &[u8], frame: usize) -> Circle {
+    let mut rng = Rng(0x9e3779b97f4a7c15 ^ frame as u64);
+    let mut top = Vec::with_capacity(TOP + 1);
+    for sample in 0..SAMPLES {
+        let radius = if sample % 3 == 0 {
+            RADII[(sample / 3) % RADII.len()]
+        } else if sample % 3 == 1 {
+            let value = rng.next() as u64;
+            1 + (value as u128 * value as u128 * MAX_RADIUS as u128 / (u32::MAX as u128).pow(2))
+                as i32
+        } else {
+            rng.range(1, MAX_RADIUS + 1)
+        };
+        let outside = sample % 10 == 0;
+        let x = if outside {
+            rng.range(-radius, WIDTH as i32 + radius + 1)
+        } else {
+            rng.range(0, WIDTH as i32)
+        };
+        let y = if outside {
+            rng.range(-radius, HEIGHT as i32 + radius + 1)
+        } else {
+            rng.range(0, HEIGHT as i32)
+        };
+        if !intersects(x, y, radius) {
+            continue;
+        }
+        add_top(&mut top, scored(prefixes, x, y, radius, false, false));
+        add_top(&mut top, scored(prefixes, x, y, radius, true, false));
+    }
+
+    let mut best = scored(prefixes, 0, 0, 1, canvas[0] != 0, true);
+    for circle in top {
+        let circle = scored(
+            prefixes,
+            circle.x,
+            circle.y,
+            circle.radius,
+            circle.white,
+            true,
+        );
+        if circle.score < best.score {
+            best = circle;
+        }
+    }
+
+    let mut step = (best.radius / 2).clamp(1, 128);
+    loop {
+        let base = best;
+        for (x, y, radius) in [
+            (base.x - step, base.y, base.radius),
+            (base.x + step, base.y, base.radius),
+            (base.x, base.y - step, base.radius),
+            (base.x, base.y + step, base.radius),
+            (base.x, base.y, (base.radius - step).max(1)),
+            (base.x, base.y, (base.radius + step).min(MAX_RADIUS)),
+        ] {
+            if !intersects(x, y, radius) {
+                continue;
+            }
+            for white in [false, true] {
+                let circle = scored(prefixes, x, y, radius, white, true);
+                if circle.score < best.score {
+                    best = circle;
+                }
+            }
+        }
+        if step == 1 {
+            break;
+        }
+        step = (step / 2).max(1);
+    }
+    best
+}
+
+fn draw(canvas: &mut [u8], circle: Circle) {
+    let color = if circle.white { 255 } else { 0 };
+    for dy in -circle.radius..=circle.radius {
+        let y = circle.y + dy;
+        if y < 0 || y >= HEIGHT as i32 {
+            continue;
+        }
+        let half = ((circle.radius * circle.radius - dy * dy) as u32).isqrt() as i32;
+        let left = (circle.x - half).clamp(0, WIDTH as i32) as usize;
+        let right = (circle.x + half + 1).clamp(0, WIDTH as i32) as usize;
+        canvas[y as usize * WIDTH + left..y as usize * WIDTH + right].fill(color);
+    }
+}
+
+fn process(args: &Args, decoder: &mut Child, encoder: &mut Child) -> Result<usize, String> {
+    let mut input = decoder
+        .stdout
+        .take()
+        .ok_or("failed to open decoder output")?;
+    let mut output: ChildStdin = encoder.stdin.take().ok_or("failed to open encoder input")?;
+    let limit = match args.mode {
+        Mode::Circle => 1,
+        Mode::Future => FUTURE_FRAMES,
+    };
+    let mut frames = Frames::new(limit);
+    let mut canvas = vec![0; PIXELS];
+    let mut count = 0;
+    frames.fill(&mut input).map_err(|error| error.to_string())?;
+    while !frames.queue.is_empty() {
+        let prefixes = prefixes(&canvas, &frames);
+        let circle = best_circle(&prefixes, &canvas, count);
+        draw(&mut canvas, circle);
+        output
+            .write_all(&canvas)
+            .map_err(|error| error.to_string())?;
+        frames
+            .advance(&mut input)
+            .map_err(|error| error.to_string())?;
+        count += 1;
+        if count % (FPS * 10) == 0 {
+            eprintln!("processed {} frames", count);
+        }
+    }
+    drop(output);
+    Ok(count)
+}
+
+fn run() -> Result<(), String> {
+    let args = args()?;
+    let mut decoder = decoder(&args.input).map_err(|error| format!("ffmpeg decoder: {error}"))?;
+    let mut encoder = match encoder(&args.input, &args.output) {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = decoder.kill();
+            return Err(format!("ffmpeg encoder: {error}"));
+        }
+    };
+    let result = process(&args, &mut decoder, &mut encoder);
+    if result.is_err() {
+        let _ = decoder.kill();
+        let _ = encoder.kill();
+    }
+    let decoder_status = decoder.wait().map_err(|error| error.to_string())?;
+    let encoder_status = encoder.wait().map_err(|error| error.to_string())?;
+    let frames = result?;
+    if !decoder_status.success() {
+        return Err(format!("ffmpeg decoder exited with {decoder_status}"));
+    }
+    if !encoder_status.success() {
+        return Err(format!("ffmpeg encoder exited with {encoder_status}"));
+    }
+    eprintln!("wrote {} frames", frames);
+    Ok(())
+}
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("error: {error}");
+        eprintln!("usage: compile.exe -i input.mp4 -o output.mp4 --type circle|circle-future");
+        std::process::exit(1);
+    }
+}
