@@ -7,6 +7,8 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 const WIDTH: usize = 1280;
 const HEIGHT: usize = 720;
 const PIXELS: usize = WIDTH * HEIGHT;
+const DEFAULT_FPS: usize = 30;
+const DEFAULT_COUNT: usize = 1;
 const FUTURE_FRAMES: usize = 30;
 const SAMPLES: usize = 4096;
 const TOP: usize = 16;
@@ -16,6 +18,7 @@ const RADII: [i32; 19] = [
     1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 360, 512, 720,
 ];
 
+#[derive(Clone, Copy)]
 enum Mode {
     Circle,
     Future,
@@ -23,9 +26,11 @@ enum Mode {
 
 struct Args {
     input: PathBuf,
-    output: PathBuf,
-    mode: Mode,
+    output: Option<PathBuf>,
+    mode: Option<Mode>,
     fps: usize,
+    count: usize,
+    all: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -112,8 +117,14 @@ fn args() -> Result<Args, String> {
     let mut input = None;
     let mut output = None;
     let mut mode = None;
-    let mut fps = None;
+    let mut fps = DEFAULT_FPS;
+    let mut count = DEFAULT_COUNT;
+    let mut all = false;
     while let Some(flag) = values.next() {
+        if flag == "--all" {
+            all = true;
+            continue;
+        }
         let value = values
             .next()
             .ok_or_else(|| format!("missing value after {}", flag.to_string_lossy()))?;
@@ -128,25 +139,41 @@ fn args() -> Result<Args, String> {
                 })
             }
             Some("--fps") => {
-                fps = Some(
-                    value
-                        .to_str()
-                        .ok_or("fps must be a positive integer")?
-                        .parse::<usize>()
-                        .map_err(|_| "fps must be a positive integer")?,
-                )
+                fps = value
+                    .to_str()
+                    .ok_or("fps must be a positive integer")?
+                    .parse::<usize>()
+                    .map_err(|_| "fps must be a positive integer")?;
+                if fps == 0 {
+                    return Err("fps must be a positive integer".into());
+                }
+            }
+            Some("--count") => {
+                count = value
+                    .to_str()
+                    .ok_or("count must be a positive integer")?
+                    .parse::<usize>()
+                    .map_err(|_| "count must be a positive integer")?;
+                if count == 0 {
+                    return Err("count must be a positive integer".into());
+                }
             }
             _ => return Err(format!("unknown option {}", flag.to_string_lossy())),
         }
     }
-    let fps = fps
-        .filter(|fps| *fps > 0)
-        .ok_or("missing or invalid --fps")?;
+    if !all && output.is_none() {
+        return Err("missing -o".into());
+    }
+    if !all && mode.is_none() {
+        return Err("missing --type".into());
+    }
     Ok(Args {
         input: input.ok_or("missing -i")?,
-        output: output.ok_or("missing -o")?,
-        mode: mode.ok_or("missing --type")?,
+        output,
+        mode,
         fps,
+        count,
+        all,
     })
 }
 
@@ -405,51 +432,73 @@ fn draw(canvas: &mut [u8], circle: Circle) {
     }
 }
 
-fn process(args: &Args, decoder: &mut Child, encoder: &mut Child) -> Result<usize, String> {
+fn process(
+    mode: Mode,
+    fps: usize,
+    shapes: usize,
+    decoder: &mut Child,
+    encoder: &mut Child,
+) -> Result<usize, String> {
     let mut input = decoder
         .stdout
         .take()
         .ok_or("failed to open decoder output")?;
     let mut output: ChildStdin = encoder.stdin.take().ok_or("failed to open encoder input")?;
-    let limit = match args.mode {
+    let limit = match mode {
         Mode::Circle => 1,
         Mode::Future => FUTURE_FRAMES,
     };
     let mut frames = Frames::new(limit);
     let mut canvas = vec![0; PIXELS];
-    let mut count = 0;
+    let mut frame = 0;
     frames.fill(&mut input).map_err(|error| error.to_string())?;
     while !frames.queue.is_empty() {
-        let prefixes = prefixes(&canvas, &frames);
-        let circle = best_circle(&prefixes, &canvas, count);
-        draw(&mut canvas, circle);
+        for shape in 0..shapes {
+            let prefixes = prefixes(&canvas, &frames);
+            let circle = best_circle(&prefixes, &canvas, shapes * frame + shape);
+            draw(&mut canvas, circle);
+        }
         output
             .write_all(&canvas)
             .map_err(|error| error.to_string())?;
         frames
             .advance(&mut input)
             .map_err(|error| error.to_string())?;
-        count += 1;
-        if count % (args.fps * 10) == 0 {
-            eprintln!("processed {} frames", count);
+        frame += 1;
+        if frame % (fps * 10) == 0 {
+            eprintln!("processed {} frames", frame);
         }
     }
     drop(output);
-    Ok(count)
+    Ok(frame)
 }
 
-fn run() -> Result<(), String> {
-    let args = args()?;
+fn output(mode: Mode, fps: usize, count: usize) -> PathBuf {
+    let mut name = String::from("Bad Apple");
+    if matches!(mode, Mode::Future) {
+        name.push_str("-future");
+    }
+    if fps != DEFAULT_FPS {
+        name.push_str(&format!("-{fps}"));
+    }
+    if count != DEFAULT_COUNT {
+        name.push_str(&format!("-{count}"));
+    }
+    name.push_str(".mp4");
+    name.into()
+}
+
+fn compile(args: &Args, output: &PathBuf, mode: Mode) -> Result<(), String> {
     let mut decoder =
         decoder(&args.input, args.fps).map_err(|error| format!("ffmpeg decoder: {error}"))?;
-    let mut encoder = match encoder(&args.input, &args.output, args.fps) {
+    let mut encoder = match encoder(&args.input, output, args.fps) {
         Ok(child) => child,
         Err(error) => {
             let _ = decoder.kill();
             return Err(format!("ffmpeg encoder: {error}"));
         }
     };
-    let result = process(&args, &mut decoder, &mut encoder);
+    let result = process(mode, args.fps, args.count, &mut decoder, &mut encoder);
     if result.is_err() {
         let _ = decoder.kill();
         let _ = encoder.kill();
@@ -467,11 +516,26 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+fn run() -> Result<(), String> {
+    let args = args()?;
+    if args.all {
+        for mode in [Mode::Circle, Mode::Future] {
+            compile(&args, &output(mode, args.fps, args.count), mode)?;
+        }
+        return Ok(());
+    }
+    compile(
+        &args,
+        args.output.as_ref().ok_or("missing -o")?,
+        args.mode.ok_or("missing --type")?,
+    )
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("error: {error}");
         eprintln!(
-            "usage: compile.exe -i input.mp4 -o output.mp4 --type circle|circle-future --fps FPS"
+            "usage: compile.exe -i input.mp4 [-o output.mp4 --type circle|circle-future | --all] [--fps FPS] [--count COUNT]"
         );
         std::process::exit(1);
     }
