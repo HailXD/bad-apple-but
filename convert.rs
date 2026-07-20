@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::env;
+use std::fs;
 use std::io::{self, Read, Write};
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
@@ -316,7 +317,7 @@ $remove.Add_Click({
         $counts.SelectedIndex = [Math]::Min($at, $counts.Items.Count - 1)
     }
 })
-Add-Label 'Output video (blank for automatic)' 20 305
+Add-Label 'Output file name or path (blank for automatic)' 20 305
 $outputPath = [Windows.Forms.TextBox]::new()
 $outputPath.Location = [Drawing.Point]::new(20, 328)
 $outputPath.Size = [Drawing.Size]::new(410, 28)
@@ -778,6 +779,12 @@ fn output(mode: Mode, fps: usize, count: usize, grid: Option<&[usize]>) -> PathB
 }
 
 fn compile(args: &Args, output: &PathBuf, mode: Mode) -> Result<(), String> {
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|error| format!("create output directory: {error}"))?;
+    }
     let mut decoder =
         decoder(&args.input, args.fps).map_err(|error| format!("ffmpeg decoder: {error}"))?;
     let mut encoder = match encoder(&args.input, output, args.fps) {
