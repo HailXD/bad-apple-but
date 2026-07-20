@@ -7,7 +7,6 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 const WIDTH: usize = 1280;
 const HEIGHT: usize = 720;
 const PIXELS: usize = WIDTH * HEIGHT;
-const FPS: usize = 30;
 const FUTURE_FRAMES: usize = 30;
 const SAMPLES: usize = 4096;
 const TOP: usize = 16;
@@ -26,6 +25,7 @@ struct Args {
     input: PathBuf,
     output: PathBuf,
     mode: Mode,
+    fps: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -112,6 +112,7 @@ fn args() -> Result<Args, String> {
     let mut input = None;
     let mut output = None;
     let mut mode = None;
+    let mut fps = None;
     while let Some(flag) = values.next() {
         let value = values
             .next()
@@ -126,37 +127,46 @@ fn args() -> Result<Args, String> {
                     _ => return Err("type must be circle or circle-future".into()),
                 })
             }
+            Some("--fps") => {
+                fps = Some(
+                    value
+                        .to_str()
+                        .ok_or("fps must be a positive integer")?
+                        .parse::<usize>()
+                        .map_err(|_| "fps must be a positive integer")?,
+                )
+            }
             _ => return Err(format!("unknown option {}", flag.to_string_lossy())),
         }
     }
+    let fps = fps
+        .filter(|fps| *fps > 0)
+        .ok_or("missing or invalid --fps")?;
     Ok(Args {
         input: input.ok_or("missing -i")?,
         output: output.ok_or("missing -o")?,
         mode: mode.ok_or("missing --type")?,
+        fps,
     })
 }
 
-fn decoder(input: &PathBuf) -> io::Result<Child> {
+fn decoder(input: &PathBuf, fps: usize) -> io::Result<Child> {
+    let filter = format!(
+        "fps={fps},scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,format=gray"
+    );
     Command::new("ffmpeg")
         .args(["-v", "error", "-i"])
         .arg(input)
-        .args([
-            "-vf",
-            "fps=30,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,format=gray",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "gray",
-            "-",
-        ])
+        .args(["-vf", &filter, "-f", "rawvideo", "-pix_fmt", "gray", "-"])
         .stdout(Stdio::piped())
         .spawn()
 }
 
-fn encoder(input: &PathBuf, output: &PathBuf) -> io::Result<Child> {
+fn encoder(input: &PathBuf, output: &PathBuf, fps: usize) -> io::Result<Child> {
+    let fps = fps.to_string();
     Command::new("ffmpeg")
         .args([
-            "-v", "error", "-f", "rawvideo", "-pix_fmt", "gray", "-s:v", "1280x720", "-r", "30",
+            "-v", "error", "-f", "rawvideo", "-pix_fmt", "gray", "-s:v", "1280x720", "-r", &fps,
             "-i", "-", "-i",
         ])
         .arg(input)
@@ -174,7 +184,7 @@ fn encoder(input: &PathBuf, output: &PathBuf) -> io::Result<Child> {
             "-pix_fmt",
             "yuv420p",
             "-r",
-            "30",
+            &fps,
             "-c:a",
             "copy",
             "-shortest",
@@ -420,7 +430,7 @@ fn process(args: &Args, decoder: &mut Child, encoder: &mut Child) -> Result<usiz
             .advance(&mut input)
             .map_err(|error| error.to_string())?;
         count += 1;
-        if count % (FPS * 10) == 0 {
+        if count % (args.fps * 10) == 0 {
             eprintln!("processed {} frames", count);
         }
     }
@@ -430,8 +440,9 @@ fn process(args: &Args, decoder: &mut Child, encoder: &mut Child) -> Result<usiz
 
 fn run() -> Result<(), String> {
     let args = args()?;
-    let mut decoder = decoder(&args.input).map_err(|error| format!("ffmpeg decoder: {error}"))?;
-    let mut encoder = match encoder(&args.input, &args.output) {
+    let mut decoder =
+        decoder(&args.input, args.fps).map_err(|error| format!("ffmpeg decoder: {error}"))?;
+    let mut encoder = match encoder(&args.input, &args.output, args.fps) {
         Ok(child) => child,
         Err(error) => {
             let _ = decoder.kill();
@@ -459,7 +470,9 @@ fn run() -> Result<(), String> {
 fn main() {
     if let Err(error) = run() {
         eprintln!("error: {error}");
-        eprintln!("usage: compile.exe -i input.mp4 -o output.mp4 --type circle|circle-future");
+        eprintln!(
+            "usage: compile.exe -i input.mp4 -o output.mp4 --type circle|circle-future --fps FPS"
+        );
         std::process::exit(1);
     }
 }
