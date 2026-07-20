@@ -6,10 +6,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 const WIDTH: usize = 1280;
 const HEIGHT: usize = 720;
-const HALF_WIDTH: usize = WIDTH / 2;
-const HALF_HEIGHT: usize = HEIGHT / 2;
 const PIXELS: usize = WIDTH * HEIGHT;
-const GRID_SIZE: usize = 4;
 const DEFAULT_FPS: usize = 30;
 const DEFAULT_COUNT: usize = 1;
 const FUTURE_FRAMES: usize = 30;
@@ -34,7 +31,7 @@ struct Args {
     mode: Option<Mode>,
     fps: usize,
     count: usize,
-    grid: Option<[usize; GRID_SIZE]>,
+    grid: Option<Vec<usize>>,
     all: bool,
 }
 
@@ -118,7 +115,10 @@ impl Frames {
 }
 
 fn args() -> Result<Args, String> {
-    let mut values = env::args_os().skip(1);
+    let mut values = env::args_os().skip(1).peekable();
+    if values.peek().is_none() {
+        return interactive_args();
+    }
     let mut input = None;
     let mut output = None;
     let mut mode = None;
@@ -165,17 +165,11 @@ fn args() -> Result<Args, String> {
                 }
             }
             Some("--grid") => {
-                let counts = value
-                    .to_str()
-                    .ok_or("grid must contain four positive integers")?
-                    .split(',')
-                    .map(|count| count.parse::<usize>())
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|_| "grid must contain four positive integers")?;
-                if counts.len() != GRID_SIZE || counts.contains(&0) {
-                    return Err("grid must contain four positive integers".into());
-                }
-                grid = Some([counts[0], counts[1], counts[2], counts[3]]);
+                grid = Some(parse_counts(
+                    value
+                        .to_str()
+                        .ok_or("grid must contain positive integers")?,
+                )?);
             }
             _ => return Err(format!("unknown option {}", flag.to_string_lossy())),
         }
@@ -188,6 +182,79 @@ fn args() -> Result<Args, String> {
     }
     Ok(Args {
         input: input.ok_or("missing -i")?,
+        output,
+        mode,
+        fps,
+        count,
+        grid,
+        all,
+    })
+}
+
+fn parse_counts(value: &str) -> Result<Vec<usize>, String> {
+    let counts = value
+        .split(',')
+        .map(|count| count.trim().parse::<usize>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "counts must be positive integers")?;
+    if counts.is_empty() || counts.contains(&0) {
+        return Err("counts must be positive integers".into());
+    }
+    Ok(counts)
+}
+
+fn prompt(label: &str) -> Result<String, String> {
+    print!("{label}");
+    io::stdout().flush().map_err(|error| error.to_string())?;
+    let mut value = String::new();
+    io::stdin()
+        .read_line(&mut value)
+        .map_err(|error| error.to_string())?;
+    Ok(value.trim().trim_matches('"').into())
+}
+
+fn interactive_args() -> Result<Args, String> {
+    println!("Bad Apple converter");
+    let input = PathBuf::from(prompt("Input video: ")?);
+    let mode = match prompt("Type [circle/circle-future/all] (circle): ")?.as_str() {
+        "" | "circle" => Some(Mode::Circle),
+        "circle-future" => Some(Mode::Future),
+        "all" => None,
+        _ => return Err("type must be circle, circle-future, or all".into()),
+    };
+    let fps = match prompt("FPS (30): ")?.as_str() {
+        "" => DEFAULT_FPS,
+        value => value
+            .parse::<usize>()
+            .map_err(|_| "fps must be a positive integer")?,
+    };
+    if fps == 0 {
+        return Err("fps must be a positive integer".into());
+    }
+    let values = prompt("Counts, comma-separated for a grid (1): ")?;
+    let counts = if values.is_empty() {
+        vec![DEFAULT_COUNT]
+    } else {
+        parse_counts(&values)?
+    };
+    let (count, grid) = if counts.len() == 1 {
+        (counts[0], None)
+    } else {
+        (DEFAULT_COUNT, Some(counts))
+    };
+    let all = mode.is_none();
+    let output = if all {
+        None
+    } else {
+        let value = prompt("Output video (automatic): ")?;
+        Some(if value.is_empty() {
+            output(mode.unwrap(), fps, count, grid.as_deref())
+        } else {
+            value.into()
+        })
+    };
+    Ok(Args {
+        input,
         output,
         mode,
         fps,
@@ -453,12 +520,23 @@ fn draw(canvas: &mut [u8], circle: Circle) {
 
 fn tile(canvases: &[Vec<u8>]) -> Vec<u8> {
     let mut frame = vec![0; PIXELS];
+    let mut columns = canvases.len().isqrt();
+    if columns * columns < canvases.len() {
+        columns += 1;
+    }
+    let rows = canvases.len().div_ceil(columns);
     for (cell, canvas) in canvases.iter().enumerate() {
-        let left = cell % 2 * HALF_WIDTH;
-        let top = cell / 2 * HALF_HEIGHT;
-        for y in 0..HALF_HEIGHT {
-            for x in 0..HALF_WIDTH {
-                frame[(top + y) * WIDTH + left + x] = canvas[y * 2 * WIDTH + x * 2];
+        let column = cell % columns;
+        let row = cell / columns;
+        let left = column * WIDTH / columns;
+        let right = (column + 1) * WIDTH / columns;
+        let top = row * HEIGHT / rows;
+        let bottom = (row + 1) * HEIGHT / rows;
+        for y in top..bottom {
+            let source_y = (y - top) * HEIGHT / (bottom - top);
+            for x in left..right {
+                let source_x = (x - left) * WIDTH / (right - left);
+                frame[y * WIDTH + x] = canvas[source_y * WIDTH + source_x];
             }
         }
     }
@@ -529,7 +607,7 @@ fn process(
     Ok(frame)
 }
 
-fn output(mode: Mode, fps: usize, count: usize, grid: Option<[usize; GRID_SIZE]>) -> PathBuf {
+fn output(mode: Mode, fps: usize, count: usize, grid: Option<&[usize]>) -> PathBuf {
     let mut name = String::from("Bad Apple");
     if matches!(mode, Mode::Future) {
         name.push_str("-future");
@@ -559,8 +637,8 @@ fn compile(args: &Args, output: &PathBuf, mode: Mode) -> Result<(), String> {
             return Err(format!("ffmpeg encoder: {error}"));
         }
     };
-    let result = match args.grid {
-        Some(grid) => process(mode, args.fps, &grid, &mut decoder, &mut encoder),
+    let result = match &args.grid {
+        Some(grid) => process(mode, args.fps, grid, &mut decoder, &mut encoder),
         None => process(mode, args.fps, &[args.count], &mut decoder, &mut encoder),
     };
     if result.is_err() {
@@ -584,7 +662,11 @@ fn run() -> Result<(), String> {
     let args = args()?;
     if args.all {
         for mode in [Mode::Circle, Mode::Future] {
-            compile(&args, &output(mode, args.fps, args.count, args.grid), mode)?;
+            compile(
+                &args,
+                &output(mode, args.fps, args.count, args.grid.as_deref()),
+                mode,
+            )?;
         }
         return Ok(());
     }
@@ -596,11 +678,17 @@ fn run() -> Result<(), String> {
 }
 
 fn main() {
+    let interactive = env::args_os().len() == 1;
     if let Err(error) = run() {
         eprintln!("error: {error}");
         eprintln!(
-            "usage: compile.exe -i input.mp4 [-o output.mp4 --type circle|circle-future | --all] [--fps FPS] [--count COUNT | --grid TL,TR,BL,BR]"
+            "usage: compile.exe -i input.mp4 [-o output.mp4 --type circle|circle-future | --all] [--fps FPS] [--count COUNT | --grid COUNTS]"
         );
-        std::process::exit(1);
+        if !interactive {
+            std::process::exit(1);
+        }
+    }
+    if interactive {
+        let _ = prompt("Press Enter to close");
     }
 }
