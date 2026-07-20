@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::env;
 use std::io::{self, Read, Write};
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
@@ -13,6 +14,7 @@ const FUTURE_FRAMES: usize = 30;
 const SAMPLES: usize = 4096;
 const TOP: usize = 16;
 const MAX_BATCH: usize = 8;
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 const BANDS: i32 = 15;
 const MAX_RADIUS: i32 = 900;
 const RADII: [i32; 19] = [
@@ -203,40 +205,176 @@ fn parse_counts(value: &str) -> Result<Vec<usize>, String> {
     Ok(counts)
 }
 
-fn prompt(label: &str) -> Result<String, String> {
-    print!("{label}");
-    io::stdout().flush().map_err(|error| error.to_string())?;
-    let mut value = String::new();
-    io::stdin()
-        .read_line(&mut value)
-        .map_err(|error| error.to_string())?;
-    Ok(value.trim().trim_matches('"').into())
-}
-
 fn interactive_args() -> Result<Args, String> {
-    println!("Bad Apple converter");
-    let input = PathBuf::from(prompt("Input video: ")?);
-    let mode = match prompt("Type [circle/circle-future/all] (circle): ")?.as_str() {
-        "" | "circle" => Some(Mode::Circle),
+    const GUI: &str = r#"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$form = [Windows.Forms.Form]::new()
+$form.Text = 'Bad Apple converter'
+$form.ClientSize = [Drawing.Size]::new(540, 430)
+$form.FormBorderStyle = 'FixedDialog'
+$form.MaximizeBox = $false
+$form.TopMost = $true
+$form.StartPosition = 'CenterScreen'
+$form.BackColor = [Drawing.ColorTranslator]::FromHtml('#a8d')
+$font = [Drawing.Font]::new('Spline Sans', 10)
+$form.Font = $font
+$labelColor = [Drawing.ColorTranslator]::FromHtml('#223')
+$fieldColor = [Drawing.ColorTranslator]::FromHtml('#112')
+$textColor = [Drawing.ColorTranslator]::FromHtml('#eee')
+$accent = [Drawing.ColorTranslator]::FromHtml('#7dc')
+function Add-Label($text, $x, $y) {
+    $label = [Windows.Forms.Label]::new()
+    $label.Text = $text
+    $label.Location = [Drawing.Point]::new($x, $y)
+    $label.AutoSize = $true
+    $label.ForeColor = $labelColor
+    [void]$form.Controls.Add($label)
+}
+function Set-Field($control) {
+    $control.BackColor = $fieldColor
+    $control.ForeColor = $textColor
+}
+function Add-Button($text, $x, $y, $width) {
+    $button = [Windows.Forms.Button]::new()
+    $button.Text = $text
+    $button.Location = [Drawing.Point]::new($x, $y)
+    $button.Size = [Drawing.Size]::new($width, 30)
+    $button.FlatStyle = 'Flat'
+    $button.BackColor = $accent
+    $button.ForeColor = $labelColor
+    [void]$form.Controls.Add($button)
+    return $button
+}
+Add-Label 'Input video' 20 20
+$input = [Windows.Forms.TextBox]::new()
+$input.Location = [Drawing.Point]::new(20, 43)
+$input.Size = [Drawing.Size]::new(410, 28)
+Set-Field $input
+[void]$form.Controls.Add($input)
+$inputButton = Add-Button 'Browse' 440 41 80
+$inputButton.Add_Click({
+    $dialog = [Windows.Forms.OpenFileDialog]::new()
+    $dialog.Filter = 'Video files|*.mp4;*.mkv;*.webm;*.mov;*.avi|All files|*.*'
+    if ($dialog.ShowDialog() -eq 'OK') { $input.Text = $dialog.FileName }
+})
+Add-Label 'Type' 20 85
+$type = [Windows.Forms.ComboBox]::new()
+$type.Location = [Drawing.Point]::new(20, 108)
+$type.Size = [Drawing.Size]::new(210, 28)
+$type.DropDownStyle = 'DropDownList'
+[void]$type.Items.AddRange(@('circle', 'circle-future', 'all'))
+$type.SelectedIndex = 0
+Set-Field $type
+[void]$form.Controls.Add($type)
+Add-Label 'FPS' 260 85
+$fps = [Windows.Forms.NumericUpDown]::new()
+$fps.Location = [Drawing.Point]::new(260, 108)
+$fps.Size = [Drawing.Size]::new(120, 28)
+$fps.Minimum = 1
+$fps.Maximum = 240
+$fps.Value = 30
+$fps.BackColor = $fieldColor
+$fps.ForeColor = $textColor
+[void]$form.Controls.Add($fps)
+Add-Label 'Counts' 20 153
+$counts = [Windows.Forms.ListBox]::new()
+$counts.Location = [Drawing.Point]::new(20, 176)
+$counts.Size = [Drawing.Size]::new(210, 112)
+Set-Field $counts
+[void]$counts.Items.Add(1)
+$counts.SelectedIndex = 0
+[void]$form.Controls.Add($counts)
+Add-Label 'Selected count' 260 153
+$count = [Windows.Forms.NumericUpDown]::new()
+$count.Location = [Drawing.Point]::new(260, 176)
+$count.Size = [Drawing.Size]::new(120, 28)
+$count.Minimum = 1
+$count.Maximum = 10000
+$count.Value = 1
+$count.BackColor = $fieldColor
+$count.ForeColor = $textColor
+[void]$form.Controls.Add($count)
+$set = Add-Button 'Set' 400 174 80
+$add = Add-Button 'Add' 260 218 100
+$remove = Add-Button 'Remove' 380 218 100
+$counts.Add_SelectedIndexChanged({
+    if ($counts.SelectedIndex -ge 0) { $count.Value = $counts.SelectedItem }
+})
+$set.Add_Click({
+    if ($counts.SelectedIndex -ge 0) { $counts.Items[$counts.SelectedIndex] = [int]$count.Value }
+})
+$add.Add_Click({
+    [void]$counts.Items.Add([int]$count.Value)
+    $counts.SelectedIndex = $counts.Items.Count - 1
+})
+$remove.Add_Click({
+    if ($counts.Items.Count -gt 1 -and $counts.SelectedIndex -ge 0) {
+        $at = $counts.SelectedIndex
+        $counts.Items.RemoveAt($at)
+        $counts.SelectedIndex = [Math]::Min($at, $counts.Items.Count - 1)
+    }
+})
+Add-Label 'Output video (blank for automatic)' 20 305
+$output = [Windows.Forms.TextBox]::new()
+$output.Location = [Drawing.Point]::new(20, 328)
+$output.Size = [Drawing.Size]::new(410, 28)
+Set-Field $output
+[void]$form.Controls.Add($output)
+$outputButton = Add-Button 'Browse' 440 326 80
+$outputButton.Add_Click({
+    $dialog = [Windows.Forms.SaveFileDialog]::new()
+    $dialog.Filter = 'MP4 video|*.mp4'
+    $dialog.DefaultExt = 'mp4'
+    if ($dialog.ShowDialog() -eq 'OK') { $output.Text = $dialog.FileName }
+})
+$type.Add_SelectedIndexChanged({
+    $enabled = $type.SelectedItem -ne 'all'
+    $output.Enabled = $enabled
+    $outputButton.Enabled = $enabled
+})
+$start = Add-Button 'Start' 320 380 95
+$cancel = Add-Button 'Cancel' 425 380 95
+$cancel.Add_Click({ $form.Close() })
+$start.Add_Click({
+    if (-not [IO.File]::Exists($input.Text)) {
+        [void][Windows.Forms.MessageBox]::Show('Select an input video', 'Bad Apple converter')
+        return
+    }
+    $form.DialogResult = 'OK'
+    $form.Close()
+})
+if ($form.ShowDialog() -ne 'OK') { exit 1 }
+[Console]::Out.WriteLine($input.Text)
+[Console]::Out.WriteLine($type.SelectedItem)
+[Console]::Out.WriteLine([int]$fps.Value)
+[Console]::Out.WriteLine(($counts.Items -join ','))
+[Console]::Out.WriteLine($output.Text)
+"#;
+    let result = Command::new("powershell")
+        .args(["-NoProfile", "-STA", "-Command", GUI])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|error| format!("GUI: {error}"))?;
+    if !result.status.success() {
+        return Err("cancelled".into());
+    }
+    let values = String::from_utf8(result.stdout).map_err(|error| error.to_string())?;
+    let mut values = values.lines();
+    let input = PathBuf::from(values.next().ok_or("missing input")?);
+    let mode = match values.next().ok_or("missing type")? {
+        "circle" => Some(Mode::Circle),
         "circle-future" => Some(Mode::Future),
         "all" => None,
-        _ => return Err("type must be circle, circle-future, or all".into()),
+        _ => return Err("invalid type".into()),
     };
-    let fps = match prompt("FPS (30): ")?.as_str() {
-        "" => DEFAULT_FPS,
-        value => value
-            .parse::<usize>()
-            .map_err(|_| "fps must be a positive integer")?,
-    };
-    if fps == 0 {
-        return Err("fps must be a positive integer".into());
-    }
-    let values = prompt("Counts, comma-separated for a grid (1): ")?;
-    let counts = if values.is_empty() {
-        vec![DEFAULT_COUNT]
-    } else {
-        parse_counts(&values)?
-    };
+    let fps = values
+        .next()
+        .ok_or("missing fps")?
+        .parse::<usize>()
+        .map_err(|_| "invalid fps")?;
+    let counts = parse_counts(values.next().ok_or("missing counts")?)?;
     let (count, grid) = if counts.len() == 1 {
         (counts[0], None)
     } else {
@@ -246,7 +384,7 @@ fn interactive_args() -> Result<Args, String> {
     let output = if all {
         None
     } else {
-        let value = prompt("Output video (automatic): ")?;
+        let value = values.next().unwrap_or_default();
         Some(if value.is_empty() {
             output(mode.unwrap(), fps, count, grid.as_deref())
         } else {
@@ -262,6 +400,18 @@ fn interactive_args() -> Result<Args, String> {
         grid,
         all,
     })
+}
+
+fn message(value: &str, error: bool) {
+    let icon = if error { "Error" } else { "Information" };
+    let script = format!(
+        "Add-Type -AssemblyName System.Windows.Forms; [void][Windows.Forms.MessageBox]::Show($env:BAD_APPLE_MESSAGE, 'Bad Apple converter', 'OK', '{icon}')"
+    );
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-STA", "-Command", &script])
+        .env("BAD_APPLE_MESSAGE", value)
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
 }
 
 fn decoder(input: &PathBuf, fps: usize) -> io::Result<Child> {
@@ -679,16 +829,20 @@ fn run() -> Result<(), String> {
 
 fn main() {
     let interactive = env::args_os().len() == 1;
-    if let Err(error) = run() {
-        eprintln!("error: {error}");
-        eprintln!(
-            "usage: compile.exe -i input.mp4 [-o output.mp4 --type circle|circle-future | --all] [--fps FPS] [--count COUNT | --grid COUNTS]"
-        );
-        if !interactive {
-            std::process::exit(1);
+    match run() {
+        Ok(()) if interactive => message("Conversion complete", false),
+        Err(error) if interactive && error == "cancelled" => {}
+        Err(error) => {
+            eprintln!("error: {error}");
+            if interactive {
+                message(&error, true);
+            } else {
+                eprintln!(
+                    "usage: compile.exe -i input.mp4 [-o output.mp4 --type circle|circle-future | --all] [--fps FPS] [--count COUNT | --grid COUNTS]"
+                );
+                std::process::exit(1);
+            }
         }
-    }
-    if interactive {
-        let _ = prompt("Press Enter to close");
+        _ => {}
     }
 }
